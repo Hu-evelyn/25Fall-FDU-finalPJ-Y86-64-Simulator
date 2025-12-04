@@ -52,7 +52,7 @@ HTML_TEMPLATE = """
                     <div class="stat-item"><strong>Cache启用:</strong> <span id="cacheEnabled">否</span></div>
                     <div class="stat-item"><strong>内存类型:</strong> <span id="memoryType">N/A</span></div>
                     <div class="stat-item"><strong>执行步数:</strong> <span id="stepCount">0</span></div>
-                    <div class="stat-item"><strong>最终状态:</strong> <span id="finalState">N/A</span></div>
+                   
                 </div>
             </div>
 
@@ -116,7 +116,7 @@ HTML_TEMPLATE = """
                     document.getElementById('cacheEnabled').textContent = useCache ? '是' : '否';
                     document.getElementById('memoryType').textContent = summary.memory_type || 'N/A';
                     document.getElementById('stepCount').textContent = traceData.length;
-                    document.getElementById('finalState').textContent = traceData.length > 0 ? traceData[traceData.length-1].STAT_DESC : 'N/A';
+                   
                     document.getElementById('totalSteps').textContent = traceData.length;
 
                     // 更新Cache信息

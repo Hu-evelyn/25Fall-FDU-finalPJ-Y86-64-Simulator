@@ -1,0 +1,9 @@
+| # prog11: Force sparse memory usage >16MB in dict (2 writes at 16MB+)
+| # Use irmovq to set large addresses, then rmmovq to write non-zero values
+0x000: 30f00100000000000000 | irmovq $1, %rax # value=1
+0x00a: 30f30000000100000000 | irmovq $0x1000000, %rbx # base=16MB (0x1000000)
+0x014: 40030000000000000000 | rmmovq %rax, 0(%rbx) # write to 16MB (>16MB, dict)
+0x01e: 30f10000100000000000 | irmovq $0x1000, %rcx # offset=4096
+0x028: 6013 | addq %rcx, %rbx # base +=4096 =16MB+4096
+0x02a: 40030000000000000000 | rmmovq %rax, 0(%rbx) # write to 16MB+4096 (>16MB, dict)
+0x034: 00 | halt # end

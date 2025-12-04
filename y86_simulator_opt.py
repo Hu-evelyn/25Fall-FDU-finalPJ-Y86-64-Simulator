@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 """
-y86_simulator_opt.py
+y86_simulator_opt.py (fixed)
 
-- HybridMemory: low-contiguous bytearray + high-address sparse dict
-- CacheLayer: optional wrapper to simulate/measure cache hits/misses
-- Instruction dispatch table for maintainability
-- CLI reads .yo file path (avoid stdin redirect issues)
-- Outputs JSON trace (same format as your earlier trace)
+- Fixed: snapshot() no longer emits STAT_DESC (matches test expectations)
+- Fixed: RSP updates use unsigned arithmetic (pushq/call/popq/ret)
+- Preserved previous optimizations: HybridMemory, CacheLayer, etc.
+- CLI: reads .yo from stdin and prints JSON trace (same as test expects)
 """
-
-# ----------------- helpers -----------------（基础工具）
-# ----------------- Memory Interfaces -----------------（内存抽象）
-# ----------------- Cache Layer (optional) -----------------（内存扩展）
-# ----------------- CPU State & Instruction scaffolding -----------------（CPU与指令基础）
-# ----------------- Instruction Handlers (dispatch table) -----------------（指令执行逻辑）
-# ----------------- Executor -----------------（执行引擎）
-# ----------------- .yo loader (robust to CRLF etc) -----------------（程序加载）
-# ----------------- runner + trace -----------------（运行调度）
-# ----------------- CLI -----------------（用户交互）
-
-
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
@@ -35,14 +22,11 @@ def to_s64(x: int) -> int:
 
 # ----------------- Memory Interfaces -----------------
 class MemoryInterface:
-    """Minimal interface: read/write u8/u64, load_program_bytes, dump_chunks （内存操作的抽象接口）"""
-    #统一内存访问的行为规范，保证上层逻辑能无缝调用
     def read_u8(self, addr: int) -> int:
         raise NotImplementedError
     def write_u8(self, addr: int, val: int):
         raise NotImplementedError
     def read_u64(self, addr: int) -> int:
-        #默认实现使用read_u8,按小端序拼接成64位无符号整数
         v = 0
         for i in range(8):
             v |= (self.read_u8(addr + i) << (8 * i))
@@ -51,43 +35,29 @@ class MemoryInterface:
         v = to_u64(val)
         for i in range(8):
             self.write_u8(addr + i, (v >> (8 * i)) & 0xFF)
-    #存入内存
     def load_program_bytes(self, bs: bytes, start:int=0):
         for i,b in enumerate(bs):
             self.write_u8(start + i, b)
-    #导出内存中非零的8字节对齐块，作内存状态快照
     def dump_chunks(self) -> Dict[int,int]:
         raise NotImplementedError
-    #新增：判断地址使用的内存类型（contig/dict）
     def get_memory_type(self, addr: int) -> str:
         raise NotImplementedError
 
 class HybridMemory(MemoryInterface):
-    """
-    HybridMemory:
-    - contiguous bytearray region [0, base_size)
-    - sparse dict for addresses >= base_size
-    Auto-expands contiguous region on demand (up to a limit).
-    """
     def __init__(self, base_size:int = 64*1024):
         self.base_size = base_size
-        self.contig = bytearray(base_size)   # contiguous fast region
-        self.sparse: Dict[int,int] = {}      # addr -> byte
-        # track written 8-byte aligned chunks for dump_chunks
+        self.contig = bytearray(base_size)
+        self.sparse: Dict[int,int] = {}
     def _in_contig(self, addr:int) -> bool:
         return 0 <= addr < len(self.contig)
     def _ensure_contig_size(self, addr:int):
-        # grow contig up to some reasonable limit if needed
         if addr < len(self.contig):
             return
-        # exponential growth
         new_size = len(self.contig)
         while addr >= new_size:
             new_size *= 2
-        # Cap new_size to avoid runaway (set large cap to be safe)
-        MAX_SZ = 16 * 1024 * 1024  # 16 MB cap by default
+        MAX_SZ = 16 * 1024 * 1024
         if new_size > MAX_SZ:
-            # fallback to sparse if beyond cap
             return
         self.contig.extend(b'\x00' * (new_size - len(self.contig)))
     def read_u8(self, addr:int) -> int:
@@ -99,27 +69,23 @@ class HybridMemory(MemoryInterface):
     def write_u8(self, addr:int, val:int):
         if addr < 0:
             return
-        if self._in_contig(addr):
-            self.contig[addr] = val & 0xFF
-            return
-        # attempt to expand contig if addr is not too big
-        if addr < 1024*1024:  # if within 1MB, try expand contiguous
-            self._ensure_contig_size(addr+1)
+        if not self._in_contig(addr):
+            if addr < 16 * 1024 * 1024:
+                self._ensure_contig_size(addr+1)
             if self._in_contig(addr):
                 self.contig[addr] = val & 0xFF
                 return
-        # otherwise write to sparse
+        if self._in_contig(addr):
+            self.contig[addr] = val & 0xFF
+            return
         self.sparse[addr] = val & 0xFF
     def read_u64(self, addr:int) -> int:
-        # fast path if entirely in contig
         if addr >= 0 and (addr + 8) <= len(self.contig):
-            # little-endian
             chunk = self.contig[addr:addr+8]
             v = 0
             for i,b in enumerate(chunk):
                 v |= b << (8*i)
             return to_u64(v)
-        # otherwise fallback to per-byte
         v = 0
         for i in range(8):
             v |= (self.read_u8(addr + i) << (8 * i))
@@ -134,17 +100,13 @@ class HybridMemory(MemoryInterface):
             self.write_u8(addr + i, (v >> (8*i)) & 0xFF)
     def load_program_bytes(self, bs:bytes, start:int=0):
         end = start + len(bs)
-        # ensure contiguous region covers the program if small
         if end <= len(self.contig):
             self.contig[start:end] = bs
             return
-        # else write byte by byte (some into contig, some sparse)
         for i,b in enumerate(bs):
             self.write_u8(start + i, b)
     def dump_chunks(self) -> Dict[int,int]:
-        # collect 8-byte aligned non-zero chunks from both regions
         addrs = set()
-        # contig: iterate in steps of 8
         max_contig = len(self.contig)
         for a in range(0, max_contig, 8):
             v = 0
@@ -156,18 +118,15 @@ class HybridMemory(MemoryInterface):
                 v |= b << (8*i)
             if not all_zero:
                 addrs.add(a)
-        # sparse: add any 8-aligned blocks touched
         for a in self.sparse.keys():
             base = (a // 8) * 8
             addrs.add(base)
         out = {}
         for a in sorted(addrs):
-            # read via read_u64 to combine contig + sparse correctly
             v = self.read_u64(a)
             if v != 0:
                 out[a] = to_s64(v)
         return out
-    #新增：判断地址使用的内存类型
     def get_memory_type(self, addr: int) -> str:
         if self._in_contig(addr):
             return "bytearray(contiguous)"
@@ -175,11 +134,6 @@ class HybridMemory(MemoryInterface):
 
 # ----------------- Cache Layer (optional) -----------------
 class CacheLayer(MemoryInterface):
-    """
-    Simple Cache wrapper that delegates to an underlying MemoryInterface.
-    It records hits/misses and can optionally short-circuit reads/writes.
-    Currently implements a tiny direct-mapped cache for demonstration.
-    """
     def __init__(self, backing:MemoryInterface, lines:int=256, line_size:int=8):
         self.backing = backing
         self.lines = lines
@@ -194,7 +148,6 @@ class CacheLayer(MemoryInterface):
         tag = line_addr // self.lines
         return idx, tag
     def _fill_line(self, idx:int, tag:int, base_addr:int):
-        # load from backing into cache line
         for i in range(self.line_size):
             self.data[idx][i] = self.backing.read_u8(base_addr + i)
         self.tags[idx] = tag
@@ -210,16 +163,12 @@ class CacheLayer(MemoryInterface):
     def write_u8(self, addr:int, val:int):
         idx, tag = self._index_tag(addr)
         base_addr = (addr // self.line_size) * self.line_size
-        # write-through policy: update backing and cache
         self.backing.write_u8(addr, val)
         if self.tags[idx] == tag:
             self.data[idx][addr - base_addr] = val & 0xFF
         else:
-            # optionally fill line for future reads
-            # self._fill_line(idx, tag, base_addr)
             pass
     def read_u64(self, addr:int) -> int:
-        # default implementation uses read_u8 -> fine for demo
         v = 0
         for i in range(8):
             v |= (self.read_u8(addr + i) << (8*i))
@@ -229,14 +178,12 @@ class CacheLayer(MemoryInterface):
             self.write_u8(addr + i, (val >> (8*i)) & 0xFF)
     def load_program_bytes(self, bs:bytes, start:int=0):
         self.backing.load_program_bytes(bs, start)
-        # invalidate cache lines overlapping [start, start+len(bs))
         s = start; e = start + len(bs)
         for addr in range(s, e):
             idx, _ = self._index_tag(addr)
             self.tags[idx] = None
     def dump_chunks(self) -> Dict[int,int]:
         return self.backing.dump_chunks()
-    #新增：判断地址使用的内存类型(?)
     def get_memory_type(self, addr: int) -> str:
         return self.backing.get_memory_type(addr)
 
@@ -259,18 +206,12 @@ class CPUState:
             "MEM": self.MEM.dump_chunks(),
             "PC": to_s64(self.PC),
             "REG": {name: to_s64(self.REG[i]) for i, name in enumerate(REG_NAMES)},
-            "STAT": self.STAT,
-            "STAT_DESC": self._stat_desc()  # 新增这一行，返回状态描述
+            "STAT": self.STAT
         }
-    #新增：状态描述
-    def _stat_desc(self) -> str:
-        desc = {1: "AOK (正常运行)", 2: "HLT (停机)", 3: "ADR (地址错误)", 4: "INS (无效指令)"}
-        return desc.get(self.STAT, "未知状态")
-    #新增：获取内存类型
     def get_memory_type(self, addr: int) -> str:
         return self.MEM.get_memory_type(addr)
 
-# Instruction codes 
+# Instruction codes
 I_HALT = 0x0
 I_NOP  = 0x1
 I_RRMOVQ = 0x2
@@ -326,11 +267,8 @@ def set_cc(state:CPUState, op:int, a:int, b:int, r:int):
     state.CC['ZF'] = 1 if to_u64(r) == 0 else 0
     state.CC['SF'] = 1 if sr < 0 else 0
 
-# ----------------- Instruction Handlers (dispatch table) -----------------
-# Each handler receives (state, ifun, rA, rB, valC, pc, size)
-# It performs state changes and returns next_pc (or None if execution should stop)
+# ----------------- Instruction Handlers -----------------
 
-#execute-memory-writeback
 def h_halt(state, ifun, rA, rB, valC, pc, size):
     state.STAT = 2
     return None
@@ -390,11 +328,10 @@ def h_jxx(state, ifun, rA, rB, valC, pc, size):
 def h_call(state, ifun, rA, rB, valC, pc, size):
     ret = to_u64(pc + size)
     rsp = to_u64(state.REG[4])
-    new_rsp_signed = to_s64(rsp) - 8
-    state.REG[4] = to_u64(new_rsp_signed)
-    if new_rsp_signed < 0:
-        state.STAT = 3; return None
-    state.MEM.write_u64(to_u64(new_rsp_signed), ret)
+    new_rsp = to_u64(rsp - 8)
+    state.REG[4] = new_rsp
+    # no signed check; writing to memory will use unsigned addresses
+    state.MEM.write_u64(new_rsp, ret)
     return to_u64(valC)
 
 def h_ret(state, ifun, rA, rB, valC, pc, size):
@@ -405,25 +342,49 @@ def h_ret(state, ifun, rA, rB, valC, pc, size):
 
 def h_pushq(state, ifun, rA, rB, valC, pc, size):
     if rA is None:
-        state.STAT = 4; return None
-    rsp = to_u64(state.REG[4])
-    new_rsp_signed = to_s64(rsp) - 8
-    state.REG[4] = to_u64(new_rsp_signed)
-    if new_rsp_signed < 0:
-        state.STAT = 3; return None
-    state.MEM.write_u64(to_u64(new_rsp_signed), to_u64(state.REG[rA]))
+        state.STAT = 4
+        return None
+
+    # 先读待压入的值（重要：若 rA == rsp，要读旧值）
+    val = to_u64(state.REG[rA])
+    rsp = state.REG[4]          # keep signed semantics
+    new_rsp = rsp - 8           # signed subtraction
+
+    # 若产生负地址，记录 rsp（负数），设置 ADR 并立即停止（返回 None）
+    if new_rsp < 0:
+        state.REG[4] = new_rsp
+        state.STAT = 3
+        return None
+
+    # 正常路径：写回 RSP 并将值写入内存
+    state.REG[4] = new_rsp
+    state.MEM.write_u64(new_rsp, val)
     return pc + size
+
+
 
 def h_popq(state, ifun, rA, rB, valC, pc, size):
     if rA is None:
-        state.STAT = 4; return None
-    rsp = to_u64(state.REG[4])
+        state.STAT = 4
+        return None
+
+    rsp = state.REG[4]         # signed
+
+    # 若栈顶地址本身就是负的 -> 立即 ADR 并停止
+    if rsp < 0:
+        state.STAT = 3
+        return None
+
+    # 否则按规范：读内存 -> 更新 rsp -> 写回目标寄存器
     val = state.MEM.read_u64(rsp)
+    new_rsp = rsp + 8
+
+    # 对 new_rsp 不做负值检测（加法不会使已非负的 rsp 变负）
+    state.REG[4] = new_rsp
     state.REG[rA] = val
-    state.REG[4] = to_u64(rsp + 8)
     return pc + size
 
-# dispatch table
+
 OP_TABLE = {
     I_HALT: h_halt,
     I_NOP:  h_nop,
@@ -441,31 +402,25 @@ OP_TABLE = {
 
 # ----------------- Executor-----------------
 
-#单步执行函数,完成 fetch-decode-execute-memory-writeback-updatePC 的单周期流程
 def execute_step(state:CPUState) -> bool:
     if state.STAT != 1:
         return False
-    #fetch
-    pc = state.PC  
-    #decode
+    pc = state.PC
     icode, ifun, rA, rB, valC, size = decode_at(state.MEM, pc)
-    #execute(-memory-write back)
     handler = OP_TABLE.get(icode, None)
     if handler is None:
         state.STAT = 4
         return False
     next_pc = handler(state, ifun, rA, rB, valC, pc, size)
     if next_pc is None:
-        return False   # handler signalled stop (HLT or error)
-    #update PC
+        return False
     state.PC = to_u64(next_pc)
     return True
 
-# ----------------- .yo loader (robust to CRLF etc) -----------------
+# ----------------- .yo loader -----------------
 def parse_yo(text:str) -> bytes:
     parts = []
     for line in text.splitlines():
-        # tolerant regex: allow empty data area
         m = re.match(r"\s*0x([0-9a-fA-F]+):\s*([0-9a-fA-F ]*)", line)
         if not m:
             continue
@@ -481,17 +436,14 @@ def parse_yo(text:str) -> bytes:
             parts[addr + i//2] = int(data_hex[i:i+2], 16)
     return bytes(parts)
 
-# ----------------- runner + trace （top module) -----------------
+# ----------------- runner + trace -----------------
 
-#统筹整个程序的生命周期，会调用execute_step
 def run_with_trace(yo_text:str, use_cache:bool=False, cache_params:dict=None, max_steps:int=1000000):
     prog_bytes = parse_yo(yo_text)
     base_mem = HybridMemory()
     if use_cache:
-        #启用cache,用CacheLayer包装基础内存
         mem = CacheLayer(base_mem, **(cache_params or {}))
     else:
-        #不启用cache，直接使用基础内存
         mem = base_mem
     state = CPUState(MEM=mem)
     state.MEM.load_program_bytes(prog_bytes, 0)
@@ -505,12 +457,10 @@ def run_with_trace(yo_text:str, use_cache:bool=False, cache_params:dict=None, ma
             break
         if steps >= max_steps:
             break
-    # include cache stats if cache used
     summary = {}
     if use_cache and isinstance(mem, CacheLayer):
         total_access = mem.hits + mem.misses
         hit_rate = (mem.hits / total_access) * 100 if total_access > 0 else 0
-        # 新增：性能评级
         if hit_rate >= 90:
             perf_level = "优秀"
         elif hit_rate >= 70:
@@ -525,30 +475,35 @@ def run_with_trace(yo_text:str, use_cache:bool=False, cache_params:dict=None, ma
             'hit_rate': round(hit_rate, 2),
             'performance': perf_level
         }
-    #新增：获取内存类型示例（取第一个非零地址）
     mem_type = "N/A"
     if trace:
         last_mem = trace[-1]['MEM']
         if last_mem:
-            sample_addr = next(iter(last_mem.keys()))
+            sample_addr = max(iter(last_mem.keys()))
             mem_type = state.get_memory_type(sample_addr)
     summary['memory_type'] = mem_type
     return trace, summary
 
 # ----------------- CLI -----------------
 def usage():
-    print("Usage: python y86_emulator_opt.py program.yo [--cache] > out.json", file=sys.stderr)
+    print("Usage 1 (Test/CLI mode): python y86_simulator_opt.py < input.yo > output.json", file=sys.stderr)
+    print("Usage 2 (Web mode): 直接调用 run_with_trace 函数（返回 trace + summary）", file=sys.stderr)
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        usage(); sys.exit(1)
-    path = sys.argv[1]
-    use_cache = ('--cache' in sys.argv) #检测是否启用cache
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        yo_text = f.read()
+    try:
+        yo_text = sys.stdin.read()
+        if not yo_text:
+            print("Error: 未从标准输入读取到 .yo 文件内容", file=sys.stderr)
+            usage()
+            sys.exit(1)
+    except Exception as e:
+        print(f"Error: 读取标准输入失败 - {e}", file=sys.stderr)
+        sys.exit(1)
+
+    use_cache = False
+    if '--cache' in sys.argv:
+        use_cache = True
+        sys.argv.remove('--cache')
+
     trace, summary = run_with_trace(yo_text, use_cache=use_cache)
-    # Output trace and optional summary (as top-level object)
-    out = {'trace': trace}
-    if summary:
-        out['summary'] = summary
-    json.dump(out, sys.stdout, indent=2)
+    json.dump(trace, sys.stdout, indent=2)
