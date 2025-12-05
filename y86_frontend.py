@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""y86_frontend.py（修正版）"""
+"""y86_frontend.py"""
 from flask import Flask, request, jsonify, render_template_string
 from y86_simulator_opt import run_with_trace
 
 app = Flask(__name__)
 
-# 修正JavaScript大括号冲突：用`{ }`替代`{{ }}`，或用模板转义
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -52,7 +51,7 @@ HTML_TEMPLATE = """
                     <div class="stat-item"><strong>Cache启用:</strong> <span id="cacheEnabled">否</span></div>
                     <div class="stat-item"><strong>内存类型:</strong> <span id="memoryType">N/A</span></div>
                     <div class="stat-item"><strong>执行步数:</strong> <span id="stepCount">0</span></div>
-                   
+                    <div class="stat-item"><strong>执行耗时:</strong> <span id="execTime">0 毫秒</span></div>
                 </div>
             </div>
 
@@ -116,7 +115,7 @@ HTML_TEMPLATE = """
                     document.getElementById('cacheEnabled').textContent = useCache ? '是' : '否';
                     document.getElementById('memoryType').textContent = summary.memory_type || 'N/A';
                     document.getElementById('stepCount').textContent = traceData.length;
-                   
+                    document.getElementById('execTime').textContent = (summary.execution_time_ms || 0) + ' 毫秒';
                     document.getElementById('totalSteps').textContent = traceData.length;
 
                     // 更新Cache信息

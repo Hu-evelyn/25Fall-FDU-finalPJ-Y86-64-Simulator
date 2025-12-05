@@ -1,0 +1,10 @@
+| # prog12: Extreme memory-intensive (loop r/w single address 100000 times)
+0x000: 30f30080000000000000 | irmovq $128, %rbx # base=128 (one address)
+0x00a: 30f200a0860100000000 | irmovq $100000, %rdx # loop=100000 (extreme freq)
+0x014: 30f40100000000000000 | irmovq $1, %r14 # inc=1
+0x01e: 50a30000000000000000 | mrmovq 0(%rbx), %r10 # read [rbx]
+0x028: 60a4 | addq %r14, %r10 # inc value
+0x02a: 40a30000000000000000 | rmmovq %r10, 0(%rbx) # write [rbx]
+0x034: 6112 | subq %r14, %rdx # rdx -=1
+0x036: 74001e000000000000 | jne 0x01e # loop
+0x03f: 00 | halt

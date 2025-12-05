@@ -1,18 +1,13 @@
 #!/usr/bin/env python3
-"""
-y86_simulator_opt.py (fixed)
+"""y86_simulator_opt.py """
 
-- Fixed: snapshot() no longer emits STAT_DESC (matches test expectations)
-- Fixed: RSP updates use unsigned arithmetic (pushq/call/popq/ret)
-- Preserved previous optimizations: HybridMemory, CacheLayer, etc.
-- CLI: reads .yo from stdin and prints JSON trace (same as test expects)
-"""
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import sys, re, json
+import time
 
-# ----------------- helpers -----------------
+# ----------------- transformer -----------------
 def to_u64(x: int) -> int:
     return x & 0xFFFFFFFFFFFFFFFF
 
@@ -51,6 +46,7 @@ class HybridMemory(MemoryInterface):
     def _in_contig(self, addr:int) -> bool:
         return 0 <= addr < len(self.contig)
     def _ensure_contig_size(self, addr:int):
+        #小地址段自动扩容连续内存（2倍扩容，上限16MB）
         if addr < len(self.contig):
             return
         new_size = len(self.contig)
@@ -70,14 +66,18 @@ class HybridMemory(MemoryInterface):
         if addr < 0:
             return
         if not self._in_contig(addr):
+            #地址在连续内存外，但小于16MB：先尝试扩容连续内存
             if addr < 16 * 1024 * 1024:
                 self._ensure_contig_size(addr+1)
+            #扩容后若能容纳，存连续内存；否则存稀疏dict
             if self._in_contig(addr):
                 self.contig[addr] = val & 0xFF
                 return
+        #原本就在连续内存内：直接写入
         if self._in_contig(addr):
             self.contig[addr] = val & 0xFF
             return
+        #超出16MB上限：存稀疏dict
         self.sparse[addr] = val & 0xFF
     def read_u64(self, addr:int) -> int:
         if addr >= 0 and (addr + 8) <= len(self.contig):
@@ -132,7 +132,7 @@ class HybridMemory(MemoryInterface):
             return "bytearray(contiguous)"
         return "dict(sparse)"
 
-# ----------------- Cache Layer (optional) -----------------
+# ----------------- Cache Layer (可选) -----------------
 class CacheLayer(MemoryInterface):
     def __init__(self, backing:MemoryInterface, lines:int=256, line_size:int=8):
         self.backing = backing
@@ -143,14 +143,15 @@ class CacheLayer(MemoryInterface):
         self.hits = 0
         self.misses = 0
     def _index_tag(self, addr:int) -> Tuple[int,int]:
-        line_addr = addr // self.line_size
-        idx = line_addr % self.lines
-        tag = line_addr // self.lines
+        line_addr = addr // self.line_size #地址对应的缓存行号
+        idx = line_addr % self.lines #缓存行索引
+        tag = line_addr // self.lines #标签
         return idx, tag
     def _fill_line(self, idx:int, tag:int, base_addr:int):
         for i in range(self.line_size):
+             #从底层内存读取数据
             self.data[idx][i] = self.backing.read_u8(base_addr + i)
-        self.tags[idx] = tag
+        self.tags[idx] = tag #标记缓存行的标签
     def read_u8(self, addr:int) -> int:
         idx, tag = self._index_tag(addr)
         base_addr = (addr // self.line_size) * self.line_size
@@ -187,7 +188,7 @@ class CacheLayer(MemoryInterface):
     def get_memory_type(self, addr: int) -> str:
         return self.backing.get_memory_type(addr)
 
-# ----------------- CPU State & Instruction scaffolding -----------------
+# ----------------- CPU State -----------------
 REG_NAMES = [
     "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
     "r8","r9","r10","r11","r12","r13","r14"
@@ -211,6 +212,7 @@ class CPUState:
     def get_memory_type(self, addr: int) -> str:
         return self.MEM.get_memory_type(addr)
 
+# -----------------Instruction processing-----------------
 # Instruction codes
 I_HALT = 0x0
 I_NOP  = 0x1
@@ -225,7 +227,7 @@ I_RET   = 0x9
 I_PUSHQ = 0xA
 I_POPQ  = 0xB
 
-# decode instruction (returns tuple)
+# decode instruction
 def decode_at(mem:MemoryInterface, pc:int):
     byte0 = mem.read_u8(pc)
     icode = (byte0 >> 4) & 0xF
@@ -267,8 +269,7 @@ def set_cc(state:CPUState, op:int, a:int, b:int, r:int):
     state.CC['ZF'] = 1 if to_u64(r) == 0 else 0
     state.CC['SF'] = 1 if sr < 0 else 0
 
-# ----------------- Instruction Handlers -----------------
-
+# instruction handlers
 def h_halt(state, ifun, rA, rB, valC, pc, size):
     state.STAT = 2
     return None
@@ -330,7 +331,6 @@ def h_call(state, ifun, rA, rB, valC, pc, size):
     rsp = to_u64(state.REG[4])
     new_rsp = to_u64(rsp - 8)
     state.REG[4] = new_rsp
-    # no signed check; writing to memory will use unsigned addresses
     state.MEM.write_u64(new_rsp, ret)
     return to_u64(valC)
 
@@ -344,47 +344,37 @@ def h_pushq(state, ifun, rA, rB, valC, pc, size):
     if rA is None:
         state.STAT = 4
         return None
-
-    # 先读待压入的值（重要：若 rA == rsp，要读旧值）
     val = to_u64(state.REG[rA])
-    rsp = state.REG[4]          # keep signed semantics
-    new_rsp = rsp - 8           # signed subtraction
-
-    # 若产生负地址，记录 rsp（负数），设置 ADR 并立即停止（返回 None）
+    rsp = state.REG[4] 
+    new_rsp = rsp - 8  
+    # 若产生负地址，记录 rsp，设置 ADR 并返回 None
     if new_rsp < 0:
         state.REG[4] = new_rsp
         state.STAT = 3
         return None
-
     # 正常路径：写回 RSP 并将值写入内存
     state.REG[4] = new_rsp
     state.MEM.write_u64(new_rsp, val)
     return pc + size
 
-
-
 def h_popq(state, ifun, rA, rB, valC, pc, size):
     if rA is None:
         state.STAT = 4
         return None
-
-    rsp = state.REG[4]         # signed
-
-    # 若栈顶地址本身就是负的 -> 立即 ADR 并停止
+    rsp = state.REG[4]
+    # 若栈顶地址本身就是负的,立即 ADR 并停止
     if rsp < 0:
         state.STAT = 3
         return None
-
-    # 否则按规范：读内存 -> 更新 rsp -> 写回目标寄存器
+    # 否则按规范：读内存->更新rsp->写回目标寄存器
     val = state.MEM.read_u64(rsp)
     new_rsp = rsp + 8
-
-    # 对 new_rsp 不做负值检测（加法不会使已非负的 rsp 变负）
+    # 不需要对new_rsp做负值检测（加法不会使非负的 rsp 变负）
     state.REG[4] = new_rsp
     state.REG[rA] = val
     return pc + size
 
-
+#调度表，字典映射，指令码->处理函数
 OP_TABLE = {
     I_HALT: h_halt,
     I_NOP:  h_nop,
@@ -401,12 +391,14 @@ OP_TABLE = {
 }
 
 # ----------------- Executor-----------------
-
 def execute_step(state:CPUState) -> bool:
     if state.STAT != 1:
         return False
+    #取值
     pc = state.PC
+    #译码
     icode, ifun, rA, rB, valC, size = decode_at(state.MEM, pc)
+    #执行（处理函数内部可能访存、写回）
     handler = OP_TABLE.get(icode, None)
     if handler is None:
         state.STAT = 4
@@ -414,41 +406,28 @@ def execute_step(state:CPUState) -> bool:
     next_pc = handler(state, ifun, rA, rB, valC, pc, size)
     if next_pc is None:
         return False
+    #更新PC
     state.PC = to_u64(next_pc)
     return True
 
-# ----------------- .yo loader -----------------
-def parse_yo(text:str) -> bytes:
-    parts = []
-    for line in text.splitlines():
-        m = re.match(r"\s*0x([0-9a-fA-F]+):\s*([0-9a-fA-F ]*)", line)
-        if not m:
-            continue
-        addr_hex = m.group(1)
-        data_hex = m.group(2).split('|')[0].strip().replace(' ', '')
-        if data_hex == '':
-            continue
-        addr = int(addr_hex, 16)
-        needed = addr + len(data_hex)//2
-        if len(parts) < needed:
-            parts.extend([0] * (needed - len(parts)))
-        for i in range(0, len(data_hex), 2):
-            parts[addr + i//2] = int(data_hex[i:i+2], 16)
-    return bytes(parts)
-
 # ----------------- runner + trace -----------------
-
 def run_with_trace(yo_text:str, use_cache:bool=False, cache_params:dict=None, max_steps:int=1000000):
     prog_bytes = parse_yo(yo_text)
+    #默认使用HybridMemory
     base_mem = HybridMemory()
+    #使用cache层
     if use_cache:
         mem = CacheLayer(base_mem, **(cache_params or {}))
     else:
         mem = base_mem
+    #初始化CPU状态
     state = CPUState(MEM=mem)
     state.MEM.load_program_bytes(prog_bytes, 0)
     trace = []
     steps = 0
+    #开始计时
+    start_time = time.perf_counter()
+    #核心执行循环（驱动"取指→译码→执行→访存→写回→更新PC"）
     while True:
         cont = execute_step(state)
         trace.append(state.snapshot())
@@ -457,7 +436,16 @@ def run_with_trace(yo_text:str, use_cache:bool=False, cache_params:dict=None, ma
             break
         if steps >= max_steps:
             break
+    #结束计时
+    end_time = time.perf_counter()
+    exec_time = (end_time - start_time) * 1000  # 转换为毫秒
+
     summary = {}
+
+    #添加耗时信息
+    summary['execution_time_ms'] = round(exec_time, 4) #保留4位小数
+
+    #添加Cache信息
     if use_cache and isinstance(mem, CacheLayer):
         total_access = mem.hits + mem.misses
         hit_rate = (mem.hits / total_access) * 100 if total_access > 0 else 0
@@ -479,10 +467,37 @@ def run_with_trace(yo_text:str, use_cache:bool=False, cache_params:dict=None, ma
     if trace:
         last_mem = trace[-1]['MEM']
         if last_mem:
-            sample_addr = max(iter(last_mem.keys()))
-            mem_type = state.get_memory_type(sample_addr)
+            if not use_cache: #只在不使用cache时确定在hybrid memory中的类型
+                sample_addr = max(iter(last_mem.keys()))
+                mem_type = state.get_memory_type(sample_addr)
+            #若启用cache,mem_type保持N/A
     summary['memory_type'] = mem_type
+
+    #添加执行步数
+    summary['step_count'] = steps
+    
     return trace, summary
+
+# ----------------- .yo loader -----------------
+def parse_yo(text:str) -> bytes:
+    parts = []
+    #提取地址和机器码字符串
+    for line in text.splitlines():
+        m = re.match(r"\s*0x([0-9a-fA-F]+):\s*([0-9a-fA-F ]*)", line)
+        if not m:
+            continue
+        addr_hex = m.group(1)
+        #忽略注释部分（以 '|' 分隔）和空格
+        data_hex = m.group(2).split('|')[0].strip().replace(' ', '')
+        if data_hex == '':
+            continue
+        addr = int(addr_hex, 16)
+        needed = addr + len(data_hex)//2
+        if len(parts) < needed:
+            parts.extend([0] * (needed - len(parts)))
+        for i in range(0, len(data_hex), 2):
+            parts[addr + i//2] = int(data_hex[i:i+2], 16)
+    return bytes(parts) #列表转字节返回
 
 # ----------------- CLI -----------------
 def usage():
