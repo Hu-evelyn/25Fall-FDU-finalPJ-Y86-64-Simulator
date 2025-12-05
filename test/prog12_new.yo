@@ -1,10 +1,15 @@
-| # prog12: Extreme memory-intensive (loop r/w single address 100000 times)
-0x000: 30f30080000000000000 | irmovq $128, %rbx # base=128 (one address)
-0x00a: 30f200a0860100000000 | irmovq $100000, %rdx # loop=100000 (extreme freq)
+| # prog12: Cache-friendly array sum (loop sum 128-byte array 10000 times)
+0x000: 30f30000010000000000 | irmovq $256, %rbx # array base=256 (small, 128 bytes)
+0x00a: 30f20027100000000000 | irmovq $10000, %rdx # outer loop=10000 (many accesses)
 0x014: 30f40100000000000000 | irmovq $1, %r14 # inc=1
-0x01e: 50a30000000000000000 | mrmovq 0(%rbx), %r10 # read [rbx]
-0x028: 60a4 | addq %r14, %r10 # inc value
-0x02a: 40a30000000000000000 | rmmovq %r10, 0(%rbx) # write [rbx]
-0x034: 6112 | subq %r14, %rdx # rdx -=1
-0x036: 74001e000000000000 | jne 0x01e # loop
-0x03f: 00 | halt
+0x01e: 30f00000000000000000 | irmovq $0, %rax # sum=0
+0x028: 30f10008000000000000 | irmovq $8, %rcx # inner loop step=8 bytes
+0x032: 30f80800000000000000 | irmovq $128, %r8 # inner count=128/8=16
+0x03c: 50330000000000000000 | mrmovq 0(%rbx), %r11 # read array[i]
+0x046: 60b0 | addq %r11, %rax # sum += array[i]
+0x048: 6013 | addq %rcx, %rbx # base +=8
+0x04a: 6118 | subq %r14, %r8 # inner --
+0x04c: 74003c000000000000 | jne 0x03c # inner loop
+0x055: 6112 | subq %r14, %rdx # outer --
+0x057: 74001e000000000000 | jne 0x01e # outer loop
+0x060: 00 | halt
